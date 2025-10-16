@@ -16,6 +16,7 @@ import org.apache.flink.api.common.state.StateDeclaration;
 import org.apache.flink.api.common.state.StateDeclarations;
 import org.apache.flink.api.common.state.ValueStateDeclaration;
 import org.apache.flink.api.common.state.v2.MapState;
+import org.apache.flink.api.common.state.v2.ValueState;
 import org.apache.flink.api.common.typeinfo.TypeDescriptors;
 import org.apache.flink.api.common.watermark.LongWatermark;
 import org.apache.flink.api.common.watermark.LongWatermarkDeclaration;
@@ -54,15 +55,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import dev.morling.demos.txbuffering.TransactionEvent.Status;
 
-public class DataStreamV2Job {
+public class DataStreamV2Job2 {
 
 	public static void main(String[] args) throws Exception {
 
 		ExecutionEnvironment env = ExecutionEnvironment.getInstance();
 //		((ExecutionEnvironmentImpl)env).getConfiguration().set(PipelineOptions.GENERIC_TYPES, false);
-//		((ExecutionEnvironmentImpl)env).getConfiguration().set(PipelineOptions.GENERIC_TYPES, false);
-//
-//		conf.setBoolean(ConfigConstants.LOCAL_START_WEBSERVER, true)
 		String bootstrapServers = "localhost:9092";
 
 		DebeziumJsonDecodingFormat decodingFormat = new DebeziumJsonDecodingFormat(true, false, TimestampFormat.ISO_8601);
@@ -151,7 +149,7 @@ public class DataStreamV2Job {
 
 		@SuppressWarnings("unchecked")
 		Sink<String> sink = (Sink<String>) Proxy.newProxyInstance(
-				DataStreamV2Job.class.getClassLoader(),
+				DataStreamV2Job2.class.getClassLoader(),
 				  new Class[] { LineageVertexProvider.class, TwoPhaseCommittingStatefulSink.class },
 				  new KafkaSinkInvocationHandler(kafkaSink));
 
@@ -173,25 +171,22 @@ public class DataStreamV2Job {
 						"customers-source"
 						)
 //				.keyBy(r -> r.op().equals("d") ? Long.valueOf((int)r.before().get("id")) : Long.valueOf((int)r.after().get("id")))
-				.connectAndProcess(transactionsStream, new WatermarkInjector("inventory.customers"))
-				.withName("customers-with-watermarks")
+				.connectAndProcess(transactionsStream, new Test())
 				.keyBy(r -> r.op().equals("d") ? Long.valueOf((int)r.before().get("id")) : Long.valueOf((int)r.after().get("id")))
-				;
+//				.connectAndProcess(null, null, null)
+				.process(new WatermarkAssignmentFunction(), r -> r.op().equals("d") ? Long.valueOf((int)r.before().get("id")) : Long.valueOf((int)r.after().get("id")));
 
 		KeyedPartitionStream<Long, DataChangeEvent> orders =
 				env.fromSource(
 						DataStreamV2SourceUtils.wrapSource(ordersSource),
 						"orders-source"
 						)
-				.connectAndProcess(transactionsStream, new WatermarkInjector("inventory.orders"))
-				.withName("orders-with-watermarks")
 				.keyBy(r -> r.op().equals("d") ? Long.valueOf((int)r.before().get("purchaser")) : Long.valueOf((int)r.after().get("purchaser")))
-				;
+				.process(new WatermarkAssignmentFunction(), r -> r.op().equals("d") ? Long.valueOf((int)r.before().get("purchaser")) : Long.valueOf((int)r.after().get("purchaser")));
 
 //		KeyedPartitionStream<Long,RowData> customers =
 
-		customers.connectAndProcess(orders, new MyJoinFunction(new Joiner(), JoinType.INNER), r -> Long.valueOf((int)r.left().after().get("id")))
-//		customers.connectAndProcess(orders, new MyJoinFunction(new Joiner(), JoinType.INNER))
+		customers.connectAndProcess(orders, new MyJoinFunction(new Joiner(), JoinType.INNER))
 
 //		input.
 
@@ -200,7 +195,7 @@ public class DataStreamV2Job {
 //				  orders,
 //				  new Joiner()
 //				)
-//		.keyBy(r -> Long.valueOf((int)r.left().after().get("id")))
+		.keyBy(r -> Long.valueOf((int)r.left().after().get("id")))
 		.process(new MaterializationFunction())
 //		.toSink(DataStreamV2SinkUtils.wrapSink(new PrintSink<>()));
 		.toSink(DataStreamV2SinkUtils.wrapSink(sink));
@@ -237,29 +232,13 @@ public class DataStreamV2Job {
 		env.execute("my job");
 	}
 
-	public static class WatermarkInjector implements TwoInputBroadcastStreamProcessFunction<DataChangeEvent, TransactionEvent, DataChangeEvent> {
-
-		public static final LongWatermarkDeclaration WATERMARK_DECLARATION = WatermarkDeclarations
-				.newBuilder("TX_WATERMARK")
-				.typeLong()
-				.combineFunctionMin()
-				.combineWaitForAllChannels(true)
-//				.defaultHandlingStrategyForward()
-				.defaultHandlingStrategyIgnore()
-				.build();
-
+	public static class Test implements TwoInputBroadcastStreamProcessFunction<DataChangeEvent, TransactionEvent, DataChangeEvent> {
 		private static final BroadcastStateDeclaration<Integer, String> TRANSACTIONS_STATE = StateDeclarations.mapStateBuilder("transactions", TypeDescriptors.INT, TypeDescriptors.STRING)
 				.buildBroadcast();
 		private static final BroadcastStateDeclaration<Integer, String> COUNTS_STATE = StateDeclarations.mapStateBuilder("counts", TypeDescriptors.INT, TypeDescriptors.STRING)
 				.buildBroadcast();
 
 		private transient ObjectMapper objectMapper;
-		private String qualifiedTable;
-
-
-		public WatermarkInjector(String qualifiedTable) {
-			this.qualifiedTable = qualifiedTable;
-		}
 
 		@Override
 		public void open(NonPartitionedContext<DataChangeEvent> ctx) throws Exception {
@@ -273,7 +252,8 @@ public class DataStreamV2Job {
 			String transactions = ctx.getStateManager().getState(TRANSACTIONS_STATE).get(record.txId());
 			String counts = ctx.getStateManager().getState(COUNTS_STATE).get(record.txId());
 
-			System.out.println("### WMIN - " + record.txId() + " - " + record.after().get("id"));
+			System.out.println("### TXID - " + record.txId());
+
 			Counts countsObj;
 			if (counts == null) {
 				countsObj = new Counts(new HashMap<String, Integer>());
@@ -281,27 +261,15 @@ public class DataStreamV2Job {
 			else {
 				countsObj = objectMapper.readValue(counts, Counts.class);
 			}
-			countsObj.increment(record.qualifiedTable());
+			countsObj.increment((String)record.source().get("table"));
+
 			ctx.getStateManager().getState(COUNTS_STATE).put(record.txId(), objectMapper.writeValueAsString(countsObj));
 
-			System.out.println("### WMIN: Emitting record " + record);
-//			System.out.println("### Counts: " + countsObj);
-//			System.out.println("### Transactions: " + transactions);
+			System.out.println(record);
+			System.out.println("### Counts: " + countsObj);
+			System.out.println("### Transactions: " + transactions);
 			output.collect(record);
 
-			if (transactions != null) {
-				TransactionEvent transactionObj = objectMapper.readValue(transactions, TransactionEvent.class);
-				if (countsObj.getCount(record.qualifiedTable()) == transactionObj.countFor(record.qualifiedTable())) {
-
-					ctx.getNonPartitionedContext().applyToAllPartitions((out, context) -> {
-//						System.out.println("### HUHU" + context.getStateManager().getState(COUNTS_STATE).get(record.txId()));
-
-						LongWatermark watermark = WATERMARK_DECLARATION.newWatermark(record.txId());
-						System.out.println("### WMIN - Emitting (On R) - " + record.txId() + " (" + qualifiedTable + ")");
-						context.getNonPartitionedContext().getWatermarkManager().emitWatermark(watermark);
-					});
-				}
-			}
 		}
 
 		@Override
@@ -310,34 +278,11 @@ public class DataStreamV2Job {
 
 			if (record.status() == Status.END) {
 				ctx.applyToAllPartitions((out, context) -> {
-					String counts = context.getStateManager().getState(COUNTS_STATE).get(record.txId());
-
-					if (counts != null) {
-						Counts countsObj = objectMapper.readValue(counts, Counts.class);
-
-						if (countsObj.getCount(qualifiedTable) == record.countFor(qualifiedTable)) {
-							LongWatermark watermark = WATERMARK_DECLARATION.newWatermark(record.txId());
-			            	System.out.println("### WMIN - Emitting (On W) - " + record.txId() + " (" + qualifiedTable + ")");
-			            	context.getNonPartitionedContext().getWatermarkManager().emitWatermark(watermark);
-						}
-					}
-
 					context.getStateManager().getState(TRANSACTIONS_STATE).put(record.txId(), objectMapper.writeValueAsString(record));
 				});
-
-				if (record.countFor(qualifiedTable) == 0) {
-					LongWatermark watermark = WATERMARK_DECLARATION.newWatermark(record.txId());
-	            	System.out.println("### WMIN - Emitting (On 0) - " + record.txId() + " (" + qualifiedTable + ")");
-	            	ctx.getWatermarkManager().emitWatermark(watermark);
-				}
 			}
 
-//			System.out.println("### WMIN - " + record.txId());
-		}
-
-		@Override
-		public Set<? extends WatermarkDeclaration> declareWatermarks() {
-			return Set.of(WATERMARK_DECLARATION);
+			System.out.println("### WMIN - " + record.txId());
 		}
 	}
 
@@ -390,6 +335,29 @@ public class DataStreamV2Job {
             		state.put(record.txId(), objectMapper.writeValueAsString(customer));
             	}
             }
+
+
+//            CustomerWithOrders customer = null;
+//            if (state.value() == null) {
+//            	customer = CustomerWithOrders.fromDataChangeEventPair(record);
+//            }
+//            else {
+//            	customer = objectMapper.readValue(state.value(), CustomerWithOrders.class);
+//            	customer = customer.updateFromDataChangeEventPair(record);
+//            }
+//
+//            if (customer != null) {
+//            	state.update(objectMapper.writeValueAsString(customer));
+//            	output.collect(objectMapper.writeValueAsString(customer));
+//            }
+//            else {
+//            	state.clear();
+//            	output.collect(objectMapper.writeValueAsString(customer));
+//            }
+
+//            System.out.println("### VALUE: " + state.value());
+
+//             System.out.println("Receiving record: " + record.left().source().get("txId") + ", " + record.right().source().get("txId"));
 		}
 
 		private Optional<String> getLatestPriorState(long txId, MapState<Long, String> state) {
@@ -429,8 +397,61 @@ public class DataStreamV2Job {
 			return OneInputStreamProcessFunction.super.onWatermark(watermark, output, ctx);
 		}
 
+//		private <T> PartitionedContext<T> getPartitionedContext(NonPartitionedContext<T> ctx) {
+//			try {
+//				Field field = DefaultNonPartitionedContext.class.getDeclaredField("partitionedContext");
+//				field.setAccessible(true);
+//				return (PartitionedContext<T>) field.get(ctx);
+//			} catch (IllegalArgumentException | IllegalAccessException | NoSuchFieldException | SecurityException e) {
+//				throw new RuntimeException("Couldn't retrieve context", e);
+//			}
+//		}
 	}
 
+	public static class WatermarkAssignmentFunction implements OneInputStreamProcessFunction<DataChangeEvent, DataChangeEvent> {
+
+		private static final ValueStateDeclaration<Long> TXN_STATE = StateDeclarations.valueState("last-txn", TypeDescriptors.  LONG);
+
+		public static final LongWatermarkDeclaration WATERMARK_DECLARATION = WatermarkDeclarations
+				.newBuilder("MY_CUSTOM_WATERMARK_IDENTIFIER")
+				.typeLong()
+				.combineFunctionMin()
+				.combineWaitForAllChannels(true)
+//				.defaultHandlingStrategyForward()
+				.defaultHandlingStrategyIgnore()
+				.build();
+
+
+//		@Override
+//		public Set<? extends WatermarkDeclaration> declareWatermarks() {
+//			return Set.of(watermarkDeclaration);
+//		}
+
+		@Override
+		public void processRecord(DataChangeEvent record, Collector<DataChangeEvent> output, PartitionedContext<DataChangeEvent> ctx) throws Exception {
+
+			ValueState<Long> txnState = ctx.getStateManager().getState(TXN_STATE);
+            Long previousTxn = txnState.value();
+//			System.out.println("### Previous: " + previousTxn);
+
+            long txId = (int)record.source().get("txId");
+            if(previousTxn != null && txId != previousTxn) {
+            	LongWatermark watermark = WATERMARK_DECLARATION.newWatermark(previousTxn);
+            	System.out.println("### SRCE - Emitting (W) - " + txId + " (" + record.source().get("table") + ")");
+            	ctx.getNonPartitionedContext().getWatermarkManager().emitWatermark(watermark);
+            }
+
+            txnState.update(txId);
+
+            System.out.println("### SRCE - Emitting (R) - " + txId + " - " + record.after().get("id"));
+			output.collect(record);
+		}
+
+		@Override
+		public Set<? extends WatermarkDeclaration> declareWatermarks() {
+			return Set.of(WatermarkAssignmentFunction.WATERMARK_DECLARATION);
+		}
+	}
 
 	public static class MyJoinFunction extends TwoInputNonBroadcastJoinProcessFunction<DataChangeEvent, DataChangeEvent, DataChangeEventPair> {
 
@@ -461,17 +482,12 @@ public class DataStreamV2Job {
 			System.out.println("### JOIN - Receiving (first) + " + watermark);
 
 			minWatermarkFromFirstInput = ((LongWatermark)watermark).getValue();
-
 			long minWatermark = Math.min(minWatermarkFromFirstInput, minWatermarkFromSecondInput);
-
-			System.out.println(this.minWatermark + " " + minWatermarkFromFirstInput + " " + minWatermarkFromSecondInput);
-
 			if (minWatermark > this.minWatermark) {
 				System.out.println("### JOIN - Emitting (first) + " + watermark);
 
 				this.minWatermark = minWatermark;
-				LongWatermark outgoingWatermark = WatermarkInjector.WATERMARK_DECLARATION.newWatermark(minWatermark);
-				ctx.getWatermarkManager().emitWatermark(outgoingWatermark);
+				ctx.getWatermarkManager().emitWatermark(watermark);
 			}
 
 			return WatermarkHandlingResult.POLL;
@@ -487,15 +503,11 @@ public class DataStreamV2Job {
 			minWatermarkFromSecondInput = ((LongWatermark)watermark).getValue();
 
 			long minWatermark = Math.min(minWatermarkFromFirstInput, minWatermarkFromSecondInput);
-
-			System.out.println(this.minWatermark + " " + minWatermarkFromFirstInput + " " + minWatermarkFromSecondInput);
-
 			if (minWatermark > this.minWatermark) {
 				System.out.println("### JOIN - Emitting (second) + " + watermark);
 
 				this.minWatermark = minWatermark;
-				LongWatermark outgoingWatermark = WatermarkInjector.WATERMARK_DECLARATION.newWatermark(minWatermark);
-				ctx.getWatermarkManager().emitWatermark(outgoingWatermark);
+				ctx.getWatermarkManager().emitWatermark(watermark);
 			}
 
 			return WatermarkHandlingResult.POLL;
@@ -510,7 +522,6 @@ public class DataStreamV2Job {
 		public void processRecord(DataChangeEvent leftRecord, DataChangeEvent rightRecord, Collector<DataChangeEventPair> output,
 				RuntimeContext ctx) throws Exception {
 
-			System.out.println("### JOIN - " + leftRecord.txId() + "/" + rightRecord.txId() + " " + leftRecord.after().get("id") + " - " + rightRecord.after().get("id"));
 
 			// TODO Auto-generated method stub
 //			System.out.println("LEFT : " + leftRecord.after());
@@ -519,7 +530,7 @@ public class DataStreamV2Job {
 //			output.collect(GenericRowData.ofKind(RowKind.INSERT, leftRecord, rightRecord));
 			output.collect(new DataChangeEventPair(leftRecord, rightRecord));
 		}
-	}
+	  }
 
 	public static class KafkaSinkInvocationHandler implements InvocationHandler, Serializable {
 
